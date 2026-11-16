@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Local environment
+.env
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Data files (raw data lives in Unity Catalog volumes, not in Git)
+data/
+*.csv
+*.asc
+*.parquet
