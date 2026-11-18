@@ -3,6 +3,7 @@
 from pyspark.sql import functions as F
 
 import silver_transforms
+import silver_merge
 
 BRONZE_SCHEMA = "workspace.bronze"
 GOLD_TABLE = "workspace.gold.dim_customer"
@@ -91,3 +92,104 @@ def load_initial(spark):
 
     # dim batches must run again after a reset
     spark.sql(f"DELETE FROM {BATCH_LOG_TABLE} WHERE table_name = '{DIM_NAME}'")
+
+LANDING_PATH = "/Volumes/workspace/bronze/landing"
+
+STAGED_SQL = f"""
+CREATE OR REPLACE TEMP VIEW vw_staged_dim_customer AS
+-- every source row: closes the current version (U) or inserts a new customer (I)
+SELECT s.client_id AS merge_key, s.*
+FROM vw_dim_source s
+UNION ALL
+-- changed customers again with NULL key: never matches, inserts the new version
+SELECT CAST(NULL AS INT) AS merge_key, s.*
+FROM vw_dim_source s
+JOIN {GOLD_TABLE} t
+  ON t.client_id = s.client_id
+ AND t.is_current = true
+WHERE t.row_hash <> s.row_hash
+  AND s.change_ts > t.valid_from
+"""
+
+SCD2_MERGE_SQL = f"""
+MERGE INTO {GOLD_TABLE} t
+USING vw_staged_dim_customer s
+ON t.client_id = s.merge_key
+AND t.is_current = true
+-- changed attributes and newer change: close the current version
+WHEN MATCHED AND t.row_hash <> s.row_hash AND s.change_ts > t.valid_from THEN
+  UPDATE SET
+    t.is_current = false,
+    t.valid_to = s.change_ts
+-- new version of a changed customer (NULL key) or a brand new customer (I)
+WHEN NOT MATCHED AND (s.merge_key IS NULL OR s.op_type = 'I') THEN
+  INSERT ({INSERT_COLUMNS})
+  VALUES (s.client_id, s.birth_date, s.gender, s.district_id, s.district_name, s.region,
+          s.row_hash, s.change_ts, TIMESTAMP '{OPEN_VALID_TO}', true)
+"""
+
+
+def count_landing_rows(spark, batch_id):
+    """Raw row count of the landing batch (before dedup), like silver rows_read."""
+    batch_folder = "batch_" + str(batch_id).zfill(4)
+    path = f"{LANDING_PATH}/client/{batch_folder}/"
+    return spark.read.json(path).count()
+
+
+def prepare_staged_source(spark, batch_id):
+    """Build vw_staged_dim_customer for one client batch."""
+    silver_merge.prepare_source(spark, "client", batch_id)
+    df_source = spark.table("vw_source_client")
+    df_district = read_district(spark)
+    df_dim_source = add_customer_attributes(df_source, df_district)
+    df_dim_source.createOrReplaceTempView("vw_dim_source")
+    spark.sql(STAGED_SQL)
+
+
+def write_log_started(spark, batch_id):
+    """Insert a STARTED row for dim_customer (replaces an old STARTED / FAILED row)."""
+    spark.sql(
+        f"DELETE FROM {BATCH_LOG_TABLE} "
+        f"WHERE table_name = '{DIM_NAME}' AND batch_id = {batch_id}"
+    )
+    spark.sql(f"""
+        INSERT INTO {BATCH_LOG_TABLE}
+            (table_name, batch_id, status, rows_read, rows_inserted, rows_updated,
+             rows_deleted, rows_skipped, started_at, finished_at)
+        SELECT '{DIM_NAME}', {batch_id}, 'STARTED', 0, 0, 0, 0, 0,
+               current_timestamp(), CAST(NULL AS TIMESTAMP)
+    """)
+
+
+def write_log_finished(spark, batch_id, status, rows_read, rows_inserted, rows_updated):
+    """Set final status and counts on the dim_customer log row."""
+    spark.sql(f"""
+        UPDATE {BATCH_LOG_TABLE}
+        SET status = '{status}',
+            rows_read = {rows_read},
+            rows_inserted = {rows_inserted},
+            rows_updated = {rows_updated},
+            finished_at = current_timestamp()
+        WHERE table_name = '{DIM_NAME}' AND batch_id = {batch_id}
+    """)
+
+
+def run_batch(spark, batch_id):
+    """Apply one client batch to dim_customer with SCD2 MERGE. Returns SUCCESS or SKIPPED."""
+    status = silver_merge.get_batch_status(spark, DIM_NAME, batch_id)
+    if status == "SUCCESS":
+        return "SKIPPED"
+
+    write_log_started(spark, batch_id)
+    try:
+        rows_read = count_landing_rows(spark, batch_id)
+        prepare_staged_source(spark, batch_id)
+        df_result = spark.sql(SCD2_MERGE_SQL)
+        result = df_result.collect()[0]
+        rows_inserted = result["num_inserted_rows"]
+        rows_updated = result["num_updated_rows"]
+        write_log_finished(spark, batch_id, "SUCCESS", rows_read, rows_inserted, rows_updated)
+    except Exception:
+        write_log_finished(spark, batch_id, "FAILED", 0, 0, 0)
+        raise
+    return "SUCCESS"
